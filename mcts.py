@@ -203,7 +203,13 @@ class MCTSPlayer(object):
         # 像alphaGo_Zero论文一样使用MCTS算法返回的pi向量
         move_probs = np.zeros(384)
 
-        acts, probs = self.mcts.get_move_probs(board, temp)
+        # 先決定當步溫度，讓訪問次數轉成機率時實際套用降溫。
+        current_temp = temp
+        if self._is_selfplay:
+            self.playout_count += 1
+            current_temp = 1.0 if self.playout_count <= 30 else 1e-3
+
+        acts, probs = self.mcts.get_move_probs(board, current_temp)
         eat_ids = []
         for a in acts:
             y1, x1, y2, x2 = map(int, move_id2move_action[a])
@@ -223,10 +229,6 @@ class MCTSPlayer(object):
         #if eat_ids:
            #plot_move_probs(acts, probs, eat_ids, "Move Probability (After Amplification)")
         if self._is_selfplay:
-            # 前 30 步用高溫度（探索更多），之後降溫
-            self.playout_count += 1
-            current_temp = 1.0 if self.playout_count <= 30 else 1e-3
-
             move = np.random.choice(
                 acts,
                 p=0.8 * probs + 0.2 * np.random.dirichlet(CONFIG['dirichlet'] * np.ones(len(probs)))
