@@ -3,6 +3,9 @@
 
 import numpy as np
 import copy
+import random
+
+from matplotlib import pyplot as plt
 
 from config import CONFIG
 from game import get_all_legal_moves_darkchess
@@ -34,20 +37,27 @@ class TreeNode(object):
         self._u = 0         # 当前节点的置信上限         # PUCT算法
         self._P = prior_p
 
-    def expand(self, action_priors, state=None):    # 这里把不合法的动作概率全部设置为0
+    def expand(self, action_priors):    # 这里把不合法的动作概率全部设置为0
         """通过创建新子节点来展开树"""
         for action, prob in action_priors:
             if action not in self._children:
-                node_type = ChanceNode if state is not None and state.is_flip_action(action) else TreeNode
-                self._children[action] = node_type(self, prob)
+                self._children[action] =  TreeNode(self, prob)
 
-    def select(self, c_puct):
-        """
-        在子节点中选择能够提供最大的Q+U的节点
-        return: (action, next_node)的二元组
-        """
-        return max(self._children.items(),
-                   key=lambda act_node: act_node[1].get_value(c_puct))
+    def select(self, c_puct, legal_moves):
+            """
+            [ISMCTS 核心改動]：過濾非法動作
+            在子节点中，只考慮「當前決定化盤面」所允許的合法动作。
+            """
+            # 利用字典推導式，只保留當下合法的分支
+            valid_children = {act: node for act, node in self._children.items() if act in legal_moves}
+            
+            # 如果這個分支是第一次遇到這種隱藏狀態（例如前幾次模擬都翻出車，這次翻出卒），
+            # valid_children 會是空的，我們回傳 None 觸發中斷與重新展開。
+            if not valid_children:
+                return None, None
+
+            return max(valid_children.items(),
+                    key=lambda act_node: act_node[1].get_value(c_puct))
 
     def get_value(self, c_puct):
         """
@@ -73,9 +83,7 @@ class TreeNode(object):
         """就像调用update()一样，但是对所有直系节点进行更新"""
         # 如果它不是根节点，则应首先更新此节点的父节点
         if self._parent:
-            # A chance edge does not consume an additional player turn.
-            parent_value = leaf_value if isinstance(self._parent, ChanceNode) else -leaf_value
-            self._parent.update_recursive(parent_value)
+            self._parent.update_recursive(-leaf_value)
         self.update(leaf_value)
 
     def is_leaf(self):
@@ -84,23 +92,6 @@ class TreeNode(object):
 
     def is_root(self):
         return self._parent is None
-
-
-class ChanceNode(TreeNode):
-    """One flip action; children are distinct revealed-piece outcomes.
-
-    Action visits/Q aggregate all sampled outcomes. Outcome nodes hold their
-    own continuation trees and are never selected using PUCT.
-    """
-
-    def sample_outcome(self, state, action):
-        probabilities = dict(state.get_reveal_outcomes(action))
-        state.do_move(action)
-        y, x, _, _ = map(int, move_id2move_action[action])
-        piece = state.state_deque[-1][y][x]
-        if piece not in self._children:
-            self._children[piece] = TreeNode(self, probabilities[piece])
-        return self._children[piece]
 
 
 # 蒙特卡洛搜索树
@@ -114,72 +105,74 @@ class MCTS(object):
         self._n_playout = n_playout
 
     def _playout(self, state):
-        """
-        进行一次搜索，根据叶节点的评估值进行反向更新树节点的参数
-        注意：state已就地修改，因此必须提供副本
-        """
-        node = self._root
-        while True:
-            if state.game_end()[0] or node.is_leaf():
-                break
-            # 贪心算法选择下一步行动
-            action, node = node.select(self._c_puct)
-            if isinstance(node, ChanceNode):
-                node = node.sample_outcome(state, action)
-            else:
-                state.do_move(action)
+            """
+            进行一次搜索，根据叶节点的评估值进行反向更新树节点的参数
+            """
+            node = self._root
+            while True:
+                if node.is_leaf():
+                    break
+                
+                # [ISMCTS 核心改動]：取得當前盤面的合法動作，傳給 select 進行過濾
+                legal_moves = state.availables
+                action, next_node = node.select(self._c_puct, legal_moves)
+                
+                # 如果走到未知的平行時空分支，直接視為葉節點中斷
+                if action is None:
+                    break
+                    
+                node = next_node
+                state.do_move(action, is_simulate=True)
 
-        # 使用网络评估叶子节点，网络输出（动作，概率）元组p的列表以及当前玩家视角的得分[-1, 1]
-        # 查看游戏是否结束
-        end, winner = state.game_end()
-        if not end:
+            # 使用网络评估叶子节点... (以下維持原程式碼不變)
             action_probs, leaf_value = self._policy(state)
-            node.expand(action_probs, state)
-        else:
-            # 对于结束状态，将叶子节点的值换成1或-1
-            if winner == -1:    # Tie
-                leaf_value = 0.0
+            # 查看游戏是否结束
+            end, winner = state.game_end()
+            if not end:
+                node.expand(action_probs)
             else:
-                leaf_value = (
-                    1.0 if winner == state.get_current_player_id() else -1.0
-                )
-        # 在本次遍历中更新节点的值和访问次数
-        # 必须添加符号，因为两个玩家共用一个搜索树
-        node.update_recursive(-leaf_value)
+                if winner == -1:    # Tie
+                    leaf_value = 0.0
+                else:
+                    leaf_value = (
+                        1.0 if winner == state.get_current_player_id() else -1.0
+                    )
+            node.update_recursive(-leaf_value)
 
     def get_move_probs(self, state, temp=1e-3, plot_probs=True):
-        """
-        按顺序运行所有搜索并返回可用的动作及其相应的概率
-        state:当前游戏的状态
-        temp:介于（0， 1]之间的温度参数
-        """
-        if state.game_end()[0]:
-            return (), np.array([], dtype=float)
+        """按顺序运行所有搜索并返回可用的动作及其相应的概率"""
         for n in range(self._n_playout):
             state_copy = copy.deepcopy(state)
+            
+            # [ISMCTS 核心改動]：盤面決定化 (Determinization)
+            if hasattr(state_copy, 'remain_pieces') and len(state_copy.remain_pieces) > 0:
+                # 處理第一步的特殊規則防呆
+                if getattr(state_copy, 'first_move', False):
+                    # 必須一直洗牌，直到抽出與當前玩家顏色相同的棋子
+                    while state_copy.current_player_color not in state_copy.remain_pieces[0]:
+                        random.shuffle(state_copy.remain_pieces)
+                else:
+                    # 非第一步，正常隨機洗牌
+                    random.shuffle(state_copy.remain_pieces)
+                
             self._playout(state_copy)
 
-        # 跟据根节点处的访问计数来计算移动概率
+            # 跟据根节点处的访问计数来计算移动概率... (以下維持原程式碼不變)
         act_visits= [(act, node._n_visits)
-                     for act, node in self._root._children.items()]
+                    for act, node in self._root._children.items()]
         acts, visits = zip(*act_visits)
         act_probs = softmax(1.0 / temp * np.log(np.array(visits) + 1e-10))
         return acts, act_probs
 
-    def update_with_move(self, last_move, revealed_piece=None):
+    def update_with_move(self, last_move):
         """
         在当前的树上向前一步，保持我们已经直到的关于子树的一切
         """
-        child = self._root._children.get(last_move)
-        if isinstance(child, ChanceNode):
-            # get_action() runs before the real flip. Without an observed
-            # piece we must reset instead of adopting an arbitrary outcome.
-            child = child._children.get(revealed_piece)
-        if child is None:
-            self._root = TreeNode(None, 1.0)
-        else:
-            self._root = child
+        if last_move in self._root._children:
+            self._root = self._root._children[last_move]
             self._root._parent = None
+        else:
+            self._root = TreeNode(None, 1.0)
 
     def __str__(self):
         return 'MCTS'
@@ -208,8 +201,6 @@ class MCTSPlayer(object):
     # 得到行动
     def get_action(self, board, temp=1e-3, return_prob=0):
         # 像alphaGo_Zero论文一样使用MCTS算法返回的pi向量
-        if board.game_end()[0]:
-            raise ValueError('Cannot choose an action after game end')
         move_probs = np.zeros(384)
 
         acts, probs = self.mcts.get_move_probs(board, temp)
