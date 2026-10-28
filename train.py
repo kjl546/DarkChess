@@ -14,7 +14,6 @@ from config import CONFIG
 from game import Game, Board
 from mcts import MCTSPlayer
 from mcts_pure import MCTS_Pure
-from players import RandomPlayer
 if CONFIG['use_redis']:
     import my_redis, redis
     import zip_array
@@ -42,37 +41,21 @@ else:
     REDIS_KEY = 'new_train_data_buffer'
     REDIS_ITERS_KEY = 'new_iters'
 
-os.makedirs(MODELS_DIR, exist_ok=True)
-
 class TrainPipeline:
     def __init__(self, init_model=None):
-        latest_ckpt = None
-        latest_iter = 0
-
-        # --- 自動找最新 checkpoint ---
-        ckpt_list = glob.glob(f"{MODELS_DIR}/new_current_policy_batch*.pth")
-        if ckpt_list:
-            latest_ckpt = max(ckpt_list, key=os.path.getmtime)
-            # 從檔名取出 batch 數字
-            match = re.search(r'batch(\d+)', latest_ckpt)
-            if match:
-                latest_iter = int(match.group(1))
-            print(f"自動載入最新 checkpoint: {latest_ckpt} (batch {latest_iter})")
-        # 若有指定 init_model 或找到最新 checkpoint，就用它
-        model_file = init_model or latest_ckpt
-        if model_file and os.path.exists(model_file):
-            try:
-                self.policy_value_net = PolicyValueNet(model_file=model_file)
-                print(f"✅ 載入模型成功: {model_file}")
-            except Exception as e:
-                print(f"❌ 模型載入失敗，從零開始: {e}")
-                self.policy_value_net = PolicyValueNet()
-        else:
-            print("⚠️ 沒找到 checkpoint，從零開始訓練")
+        # 模型只載入一次；載入失敗時停止，不改用隨機權重。
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        model_file = self._select_model(init_model)
+        self.loaded_model_path = model_file
+        self.start_iter = self._checkpoint_step(model_file)
+        if model_file is None:
             self.policy_value_net = PolicyValueNet()
+            print("沒有既有模型，從第 0 批建立新模型")
+        else:
+            self.policy_value_net = PolicyValueNet(model_file=model_file)
+            print(f"載入權重: {model_file}；已完成批次: {self.start_iter}")
+            print("目前是權重續訓；optimizer 與學習率調整狀態重新初始化")
 
-        # --- 記錄從哪個 batch 開始 ---
-        self.start_iter = latest_iter
         self.board = Board()
         self.game = Game(self.board)
         self.n_playout = CONFIG['play_out']
@@ -92,16 +75,78 @@ class TrainPipeline:
         self.buffer_size = CONFIG['buffer_size']
         self.data_buffer = deque(maxlen=self.buffer_size)
 
-        if init_model:
-            try:
-                self.policy_value_net = PolicyValueNet(model_file=init_model)
-                print('已加载上次最终模型')
-            except Exception as e:
-                print('模型路径不存在或载入失败，从零开始训练', e)
-                self.policy_value_net = PolicyValueNet()
+        self.best_policy_net = None
+        self.iters = None
+        self.data_poll_interval = float(CONFIG.get(
+            'train_data_poll_interval', 5 if CONFIG['use_redis'] else 30))
+        if self.batch_size <= 0 or self.buffer_size < self.batch_size:
+            raise ValueError('buffer_size must be at least a positive batch_size')
+        if not np.isfinite(self.data_poll_interval) or self.data_poll_interval <= 0:
+            raise ValueError('train_data_poll_interval must be finite and positive')
+
+    @staticmethod
+    def _checkpoint_step(path):
+        """批次只取自實際載入的 checkpoint；一般權重檔無批次資訊。"""
+        if path is None:
+            return 0
+        match = re.fullmatch(r'new_current_policy_batch(\d+)\.pth', os.path.basename(path))
+        return int(match.group(1)) if match else 0
+
+    @classmethod
+    def _select_model(cls, init_model):
+        """指定檔 > 最大批次 checkpoint > current 權重 > 新模型。"""
+        if init_model is not None:
+            if not os.path.isfile(init_model):
+                raise FileNotFoundError(f'指定的模型不存在: {init_model}')
+            return os.fspath(init_model)
+        checkpoints = [path for path in glob.glob(
+            os.path.join(MODELS_DIR, 'new_current_policy_batch*.pth'))
+            if re.fullmatch(r'new_current_policy_batch\d+\.pth', os.path.basename(path))
+            and os.path.isfile(path)]
+        if checkpoints:
+            return max(checkpoints, key=cls._checkpoint_step)
+        if os.path.isfile(CURRENT_POLICY_PATH):
+            return CURRENT_POLICY_PATH
+        return None
+
+    def _read_training_data(self):
+        """每次等待都重新讀取來源，不依賴會過期的記憶體長度。"""
+        if CONFIG['use_redis']:
+            before = self.redis_cli.get(REDIS_ITERS_KEY)
+            data = my_redis.get_list_range(self.redis_cli, REDIS_KEY, 0, -1)
+            generation = self.redis_cli.get(REDIS_ITERS_KEY)
+            if before != generation:
+                raise ValueError('讀取期間 Redis 資料版本改變，稍後重試')
         else:
-            print('从零开始训练')
-            self.policy_value_net = PolicyValueNet()
+            with open(TRAIN_DATA_PATH, 'rb') as data_file:
+                snapshot = pickle.load(data_file)
+            data = snapshot['data_buffer']
+            generation = snapshot['iters']
+        if generation is None:
+            raise ValueError('資料尚無 iters 版本，稍後重試')
+        return deque(data, maxlen=self.buffer_size), generation
+
+    def _wait_for_training_data(self, last_iters):
+        """版本未訓練過且樣本至少 batch_size 時才返回。
+
+        資料不足不消耗該版本；等候下一輪會重新讀檔或讀 Redis。
+        KeyboardInterrupt 不會被攔截，使用者可隨時停止等待。
+        """
+        while True:
+            try:
+                data, generation = self._read_training_data()
+            except Exception as exc:
+                print(f'資料暫不可讀，稍後重新載入: {exc}')
+            else:
+                self.data_buffer = data
+                if len(data) < self.batch_size:
+                    print(f'樣本不足 ({len(data)}/{self.batch_size})，稍後重新載入')
+                elif generation == last_iters:
+                    print(f'資料版本 {generation} 已訓練，等待新資料')
+                else:
+                    self.iters = generation
+                    return generation
+            time.sleep(self.data_poll_interval)
 
     def _fight(self, player1, player2, n_games=30):
         """雙方對戰，返回勝率、詳細勝負"""
@@ -130,6 +175,8 @@ class TrainPipeline:
 
     def multi_evaluate(self, n_games=30):
         """同時測試 current vs best, current vs pureMCTS, best vs pureMCTS"""
+        from players import RandomPlayer
+
         print("開始測試")
         # 印出檔案時間
         for path, name in [(CURRENT_POLICY_PATH, "current_policy"), (BEST_POLICY_PATH, "best_policy")]:
@@ -273,91 +320,51 @@ class TrainPipeline:
 
     def run(self):
         try:
-            last_iters = -1
-            
+            last_iters = None
+
             for i in range(self.start_iter, self.game_batch_num + self.start_iter):
-                if not CONFIG['use_redis']:
-                    while True:
-                        try:
-                            with open(TRAIN_DATA_PATH, 'rb') as data_dict:
-                                data_file = pickle.load(data_dict)
-                                self.data_buffer = data_file['data_buffer']
-                                self.iters = data_file['iters']
-
-                            if self.iters == last_iters:
-                                print(f"⏳ 等待收集程式寫入新資料... (目前樣本: {len(self.data_buffer)})")
-                                time.sleep(30) # 等待 30 秒後重新讀取
-                                continue
-
-                            print(f'已載入本地資料 ({TRAIN_DATA_PATH})')
-                            last_iters = self.iters # 更新記錄
-                            break
-                        except Exception as e:
-                            print("等待本地數據...", e)
-                            time.sleep(30)
-                else:
-                    while True:
-                        try:
-                            l = len(self.data_buffer)
-                            data = my_redis.get_list_range(self.redis_cli, REDIS_KEY, l if l == 0 else l - 1, -1)
-                            self.data_buffer.extend(data)
-                            self.iters = self.redis_cli.get(REDIS_ITERS_KEY)
-                            if self.redis_cli.llen(REDIS_KEY) > self.buffer_size:
-                                self.redis_cli.lpop(REDIS_KEY, self.buffer_size // 10)
-                            print(f"已載入 Redis 數據 ({REDIS_KEY})")
-                            break
-                        except Exception as e:
-                            print("等待 Redis 數據...", e)
-                            time.sleep(5)
-
+                generation = self._wait_for_training_data(last_iters)
                 print(f"訓練批次 {i + 1}，累積樣本數：{len(self.data_buffer)}")
-                # 等待資料足夠
-                while len(self.data_buffer) <= self.batch_size:
-                    print("⚠️ 資料量不足，等待更多資料再訓練...")
-                    time.sleep(600)
+                loss, entropy = self.policy_updata()
+                # 真正完成更新才記錄版本，資料不足或讀取失敗不會消耗批次。
+                last_iters = generation
+                time.sleep(CONFIG['train_update_interval'])
 
-                # 執行一次更新
-                if len(self.data_buffer) > self.batch_size:
-                    loss, entropy = self.policy_updata()
-                    time.sleep(CONFIG['train_update_interval'])
+                # 定期評估
+                if (i + 1) % self.check_freq == 0:
+                    # 重新載入 best model（如果檔案存在），避免 state mismatch
+                    if os.path.exists(BEST_POLICY_PATH):
+                        try:
+                            self.best_policy_net = PolicyValueNet(model_file=BEST_POLICY_PATH)
+                        except Exception as e:
+                            print("重新載入 best model 失敗:", e)
+                            self.best_policy_net = None
+                    else:
+                        print("不存在best model")
+                    results = self.multi_evaluate()
+                    # 取 current vs best 的勝率來決定是否更新 best_policy
+                    win_ratio = results.get("current_vs_best", results["current_vs_random"])[0]
+                    print(f"第 {i + 1} 批自對弈訓練，勝率：{win_ratio:.3f}")
 
-                    # 定期評估
-                    if (i + 1) % self.check_freq == 0:
-                        # 重新載入 best model（如果檔案存在），避免 state mismatch
-                        if os.path.exists(BEST_POLICY_PATH):
-                            try:
-                                self.best_policy_net = PolicyValueNet(model_file=BEST_POLICY_PATH)
-                            except Exception as e:
-                                print("重新載入 best model 失敗:", e)
-                                self.best_policy_net = None
-                        else:
-                            print("不存在best model")
-                        results = self.multi_evaluate()
-                        # 取 current vs best 的勝率來決定是否更新 best_policy
-                        win_ratio = results.get("current_vs_best", results["current_vs_random"])[0]
-                        print(f"第 {i + 1} 批自對弈訓練，勝率：{win_ratio:.3f}")
+                    # 儲存條件：勝率要超過閾值且比歷史最佳好
+                    if win_ratio > 0.55 :
+                        print(f"🎯 新最佳策略發現！勝率 {win_ratio * 100:.2f}")
+                        self.best_win_ratio = win_ratio
+                        self.policy_value_net.save_model(CURRENT_POLICY_PATH)
+                        self.policy_value_net.save_model(BEST_POLICY_PATH)
+                    else:
+                        print("勝率不足 55% 或沒有超越歷史最佳，跳過保存 best_policy")
 
-                        # 儲存條件：勝率要超過閾值且比歷史最佳好
-                        if win_ratio > 0.55 :
-                            print(f"🎯 新最佳策略發現！勝率 {win_ratio * 100:.2f}")
-                            self.best_win_ratio = win_ratio
-                            self.policy_value_net.save_model(CURRENT_POLICY_PATH)
-                            self.policy_value_net.save_model(BEST_POLICY_PATH)
-                        else:
-                            print("勝率不足 55% 或沒有超越歷史最佳，跳過保存 best_policy")
-
-                        # checkpoint
-                        self.policy_value_net.save_model(f'{MODELS_DIR}/new_current_policy_batch{i + 1}.pth')
+                    # checkpoint
+                    self.policy_value_net.save_model(f'{MODELS_DIR}/new_current_policy_batch{i + 1}.pth')
         except KeyboardInterrupt:
             print('\n⛔️ 手動終止訓練')
 
 
-if CONFIG['use_frame'] == 'paddle':
-    training_pipeline = TrainPipeline(init_model=CURRENT_POLICY_PATH)
-    training_pipeline.run()
-elif CONFIG['use_frame'] == 'pytorch':
-    training_pipeline = TrainPipeline(init_model=CURRENT_POLICY_PATH)
-    training_pipeline.run()
-else:
-    print('暂不支持您选择的框架')
-    print('训练结束')
+if __name__ == '__main__':
+    if CONFIG['use_frame'] in ('paddle', 'pytorch'):
+        # 不強制傳入 current 檔，才能啟用最新 checkpoint 的自動選擇。
+        training_pipeline = TrainPipeline()
+        training_pipeline.run()
+    else:
+        raise ValueError('不支援的訓練框架')
