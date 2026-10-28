@@ -4,6 +4,7 @@ from collections import deque
 import copy
 import os
 import pickle
+import tempfile
 import time
 import numpy as np
 from multiprocessing import Process, Queue, cpu_count
@@ -32,6 +33,8 @@ class CollectPipeline:
         self.n_playout = CONFIG['play_out']
         self.c_puct = CONFIG['c_puct']
         self.buffer_size = CONFIG['buffer_size']
+        if self.buffer_size <= 0:
+            raise ValueError('buffer_size must be positive')
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.iters = 0
 
@@ -80,39 +83,55 @@ class CollectPipeline:
         return play_data_all
 
     def save_data(self, play_data):
-        """存到本地 buffer 檔"""
-        print(f"💾 save_data() called, 收到 {len(play_data)} 筆資料")
+        """磁碟快照 + 本批資料一次；成功寫入後才更新記憶體。
 
-        buffer_file = self.buffer_path
+        一個經驗池檔案由一個主收集程序寫入；工作進程只回傳資料。
+        原子替換保障讀者不讀到半份檔案，不是多寫入者的鎖。
+        """
+        if len(play_data) == 0:
+            print('本批沒有新資料，不更新經驗池版本')
+            return
+
+        buffer_file = os.path.abspath(self.buffer_path)
         try:
-            if os.path.exists(buffer_file):
-                print(f"📂 偵測到舊 buffer，從 {buffer_file} 載入")
-                with open(buffer_file, 'rb') as data_dict:
-                    data_file = pickle.load(data_dict)
-                    old_buffer = data_file['data_buffer']
-                    self.iters = data_file['iters']
-                print(f"🔹 舊 buffer size: {len(old_buffer)}, iters={self.iters}")
-                self.data_buffer.extend(old_buffer)
-            else:
-                print(f"🆕 未發現舊 buffer，將建立新檔案 {buffer_file}")
-        except Exception as e:
-            print(f"⚠️ 載入舊 buffer 失敗: {e}")
+            with open(buffer_file, 'rb') as source:
+                snapshot = pickle.load(source)
+        except FileNotFoundError:
+            snapshot = {'data_buffer': [], 'iters': 0}
+        # 其他讀取／解碼錯誤直接交給呼叫端，不能覆蓋無法讀取的舊檔。
+        old_buffer = snapshot['data_buffer']
+        old_iters = snapshot['iters']
+        if not isinstance(old_buffer, (list, tuple, deque)):
+            raise ValueError('Invalid data_buffer in existing replay file')
+        if isinstance(old_iters, bool) or not isinstance(old_iters, (int, np.integer)) or old_iters < 0:
+            raise ValueError('Invalid iters in existing replay file')
 
-        self.data_buffer.extend(play_data)
-        self.iters += 1
+        # 不將磁碟舊資料 extend 到已經有舊資料的 self.data_buffer。
+        next_buffer = deque(old_buffer, maxlen=self.buffer_size)
+        next_buffer.extend(play_data)
+        next_iters = int(old_iters) + 1
+        next_snapshot = {'data_buffer': next_buffer, 'iters': next_iters}
 
-        while len(self.data_buffer) > self.buffer_size:
-            self.data_buffer.popleft()
-
-        print(f"📊 buffer 總長度: {len(self.data_buffer)}")
-
+        temp_path = None
         try:
-            data_dict = {'data_buffer': self.data_buffer, 'iters': self.iters}
-            with open(self.buffer_path, 'wb') as data_file:
-                pickle.dump(data_dict, data_file)
-            print(f"✅ 成功儲存 {len(self.data_buffer)} 筆資料到 {self.buffer_path}\n")
-        except Exception as e:
-            print(f"❌ 儲存失敗: {e}")
+            # 同目錄暫存檔確保在同一個檔案系統，寫完並關閉後才替換正式檔。
+            with tempfile.NamedTemporaryFile(
+                    mode='wb', dir=os.path.dirname(buffer_file),
+                    prefix=f'.{os.path.basename(buffer_file)}.', suffix='.tmp',
+                    delete=False) as target:
+                temp_path = target.name
+                pickle.dump(next_snapshot, target, protocol=pickle.HIGHEST_PROTOCOL)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temp_path, buffer_file)
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+        # 寫入失敗時不會走到這裡，重試同一批不會重複累加記憶體資料。
+        self.data_buffer = next_buffer
+        self.iters = next_iters
+        print(f'已儲存 {len(play_data)} 筆新資料；經驗池 {len(next_buffer)} 筆，版本 {next_iters}')
 
     def run(self):
         """單進程蒐集"""
