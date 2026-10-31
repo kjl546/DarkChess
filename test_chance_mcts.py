@@ -29,11 +29,12 @@ def policy(state):
 
 
 class ChanceMCTSTests(unittest.TestCase):
-    def test_probabilities_and_first_flip_rule(self):
+    def test_probabilities_follow_remaining_counts(self):
         state = board()
         state.remain_pieces = ['红兵', '红兵', '红帅', '黑帅']
+        # 正規暗棋：第一手翻棋沒有顏色限制
         self.assertEqual(dict(state.get_reveal_outcomes(FLIP)),
-                         {'红兵': 2 / 3, '红帅': 1 / 3})
+                         {'红兵': 0.5, '红帅': 0.25, '黑帅': 0.25})
         state.first_move = False
         self.assertEqual(dict(state.get_reveal_outcomes(FLIP)),
                          {'红兵': 0.5, '红帅': 0.25, '黑帅': 0.25})
@@ -58,9 +59,9 @@ class ChanceMCTSTests(unittest.TestCase):
         state = board()
         before = copy.deepcopy(state.__dict__)
         with self.assertRaises(ValueError):
-            state.do_move(FLIP, revealed_piece='黑帅')
+            state.do_move(FLIP, revealed_piece='不存在的棋')
         self.assertEqual(state.__dict__, before)
-        state.remain_pieces = ['黑帅']
+        state.remain_pieces = []
         with self.assertRaises(ValueError):
             state.do_move(FLIP)
 
@@ -269,7 +270,7 @@ class ChanceMCTSTests(unittest.TestCase):
                              dict(reversed_state.get_reveal_outcomes(FLIP)))
             with patch('game.random.choices', return_value=['红兵']) as sample:
                 state.do_move(FLIP, is_simulate=simulate)
-            self.assertEqual(sample.call_args.kwargs['weights'], (2 / 3, 1 / 3))
+            self.assertEqual(sorted(sample.call_args.kwargs['weights']), [0.25, 0.25, 0.5])
             self.assertEqual(state.remain_pieces.count('红兵'), 1)
 
     def test_pure_search_splits_outcomes_and_keeps_real_board_unchanged(self):

@@ -83,7 +83,7 @@ class TrainPipeline:
         self.batch_size = CONFIG['batch_size']
         self.epochs = CONFIG['epochs']
         self.kl_targ = CONFIG['kl_targ']
-        self.check_freq = 100
+        self.check_freq = 50
         self.game_batch_num = CONFIG['game_batch_num']
         self.best_win_ratio = 0.0
         self.pure_mcts_playout_num = 50  # 用於 pure MCTS baseline
@@ -348,6 +348,7 @@ class TrainPipeline:
 
                         # checkpoint
                         self.policy_value_net.save_model(f'{MODELS_DIR}/new_current_policy_batch{i + 1}.pth')
+                        self.policy_value_net.save_model(CURRENT_POLICY_PATH)
         except KeyboardInterrupt:
             print('\n⛔️ 手動終止訓練')
 
@@ -361,3 +362,4 @@ elif CONFIG['use_frame'] == 'pytorch':
 else:
     print('暂不支持您选择的框架')
     print('训练结束')
+

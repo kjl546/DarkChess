@@ -538,12 +538,11 @@ class Board(object):
     def get_reveal_outcomes(self, move):
         """按剩餘棋種數量回傳 (棋種, 機率)，不讀取隱藏排列順序。
 
-        保留本專案第一次翻棋必須符合當前玩家顏色的規則。
+        依正規暗棋：第一手翻棋沒有顏色限制。
         """
         if not self.is_reveal_move(move):
             raise ValueError('Move is not a covered-square reveal')
-        counts = Counter(piece for piece in self.remain_pieces
-                         if not self.first_move or piece.startswith(self.current_player_color))
+        counts = Counter(self.remain_pieces)
         total = sum(counts.values())
         if total == 0:
             raise ValueError('No eligible pieces remain for this reveal')
