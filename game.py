@@ -337,6 +337,8 @@ class Board(object):
         self._remain_backup = None
         self._reveal_backup = None
         self.remain_pieces = []
+        self.true_board = None       # 天眼：4x8 隱藏排列(僅暗棋模式)
+        self.oracle_search = False   # True 時，搜尋中的翻棋結果直接取 true_board
         self.first_move = True
         self.state_list = copy.deepcopy(state_list_init)
         self.game_start = False
@@ -353,12 +355,14 @@ class Board(object):
             self.remain_pieces = []
             self.state_list = copy.deepcopy(non_covered_state_list_init)
             self.state_deque = copy.deepcopy(non_covered_state_deque_init)
+            self.true_board = None
         else:
             red_pieces = ['红帅'] + ['红士'] * 2 + ['红象'] * 2 + ['红马'] * 2 + ['红车'] * 2 + ['红炮'] * 2 + ['红兵'] * 5
             black_pieces = ['黑帅'] + ['黑士'] * 2 + ['黑象'] * 2 + ['黑马'] * 2 + ['黑车'] * 2 + ['黑炮'] * 2 + ['黑兵'] * 5
             covered_pieces = red_pieces + black_pieces
             random.shuffle(covered_pieces)
             self.remain_pieces = covered_pieces
+            self.true_board = [list(covered_pieces[r * 8:(r + 1) * 8]) for r in range(4)]
             self.state_list = copy.deepcopy(state_list_init)
             self.state_deque = copy.deepcopy(state_deque_init)
         self.first_move = True
@@ -527,6 +531,32 @@ class Board(object):
 
         return _current_state
 
+    # 天眼 (oracle)
+    ORACLE_ORDER = ['帅', '士', '象', '车', '马', '炮', '兵']
+
+    def _true_piece(self, y, x):
+        """(y, x) 這格翻開後的真實棋子。"""
+        return self.true_board[y][x]
+
+    def get_oracle_plane(self):
+        """(14, 4, 8)：仍是暗棋的格子標上真實身份，7 紅 + 7 黑；已翻開的格子全 0。"""
+        plane = np.zeros((14, 4, 8), dtype=np.float32)
+        if self.true_board is None:
+            return plane
+        current = self.state_deque[-1]
+        for y in range(4):
+            for x in range(8):
+                if current[y][x] == '暗棋':
+                    piece = self.true_board[y][x]
+                    offset = 0 if piece.startswith('红') else 7
+                    plane[offset + self.ORACLE_ORDER.index(piece[1:])][y][x] = 1.0
+        return plane
+
+    def oracle_state(self, blind=False):
+        """current_state() 再接 14 個 oracle channel -> (76, 4, 8)；blind=True 時 oracle 平面全 0。"""
+        extra = np.zeros((14, 4, 8), dtype=np.float32) if blind else self.get_oracle_plane()
+        return np.concatenate([self.current_state(), extra], axis=0)
+
     def is_reveal_move(self, move):
         """只有起終點相同且該格仍覆蓋時，才是合法的翻棋動作。"""
         action = move_id2move_action.get(move)
@@ -538,12 +568,14 @@ class Board(object):
     def get_reveal_outcomes(self, move):
         """按剩餘棋種數量回傳 (棋種, 機率)，不讀取隱藏排列順序。
 
-        保留本專案第一次翻棋必須符合當前玩家顏色的規則。
+        依正規暗棋：第一手翻棋沒有顏色限制。
         """
         if not self.is_reveal_move(move):
             raise ValueError('Move is not a covered-square reveal')
-        counts = Counter(piece for piece in self.remain_pieces
-                         if not self.first_move or piece.startswith(self.current_player_color))
+        if self.true_board is not None and self.oracle_search:
+            y, x, _, _ = map(int, move_id2move_action[move])
+            return [(self._true_piece(y, x), 1.0)]
+        counts = Counter(self.remain_pieces)
         total = sum(counts.values())
         if total == 0:
             raise ValueError('No eligible pieces remain for this reveal')
@@ -573,6 +605,12 @@ class Board(object):
             flip = True
         if flip:
             outcomes = self.get_reveal_outcomes(move)
+            if revealed_piece is None:
+                if self.true_board is not None and (self.oracle_search or not is_simulate):
+                    # 真實對局(或天眼搜尋)：翻出的就是 true_board 上那一格
+                    candidate = self._true_piece(end_y, end_x)
+                    if candidate in dict(outcomes):
+                        revealed_piece = candidate
             if revealed_piece is None:
                 pieces, probabilities = zip(*outcomes)
                 revealed_piece = random.choices(pieces, weights=probabilities, k=1)[0]
@@ -712,7 +750,7 @@ class Game(object):
                 return winner
 
     # 使用蒙特卡洛树搜索开始自我对弈，存储游戏状态（状态，蒙特卡洛落子概率，胜负手）三元组用于神经网络训练
-    def start_self_play(self, player, is_shown=False, temp=1):
+    def start_self_play(self, player, is_shown=False, temp=1, use_oracle=False):
         self.board.init_board()     # 初始化棋盘, start_player=1
         p1, p2 = 1, 2
         states, mcts_probs, current_players = [], [], []
@@ -729,7 +767,7 @@ class Game(object):
                 temp=temp,
                 return_prob=True
             )
-            states.append(self.board.current_state())
+            states.append(self.board.oracle_state() if use_oracle else self.board.current_state())
             mcts_probs.append(move_probs)
             current_players.append(self.board.current_player_id)
             # 保存自我对弈的数据

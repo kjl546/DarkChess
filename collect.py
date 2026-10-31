@@ -72,7 +72,8 @@ class CollectPipeline:
         play_data_all = []
         for _ in range(n_games):
             self.load_model()
-            winner, play_data = self.game.start_self_play(self.mcts_player, temp=self.temp, is_shown=is_shown)
+            use_oracle = getattr(self.policy_value_net, 'oracle_active', False)
+            winner, play_data = self.game.start_self_play(self.mcts_player, temp=self.temp, is_shown=is_shown, use_oracle=use_oracle)
             play_data = list(play_data)
             self.episode_len = len(play_data)
             play_data_all.extend(self.get_equi_data(play_data))
@@ -92,7 +93,7 @@ class CollectPipeline:
                     old_buffer = data_file['data_buffer']
                     self.iters = data_file['iters']
                 print(f"🔹 舊 buffer size: {len(old_buffer)}, iters={self.iters}")
-                self.data_buffer.extend(old_buffer)
+                self.data_buffer = deque(old_buffer, maxlen=self.buffer_size)
             else:
                 print(f"🆕 未發現舊 buffer，將建立新檔案 {buffer_file}")
         except Exception as e:
@@ -209,4 +210,4 @@ if __name__ == "__main__":
     # 單進程
     # collecting_pipeline.run()
     # 多進程 (每批 40 局，4 進程)
-    collecting_pipeline.parallel_run(total_games=4, n_procs=4)
+    collecting_pipeline.parallel_run(total_games=8, n_procs=8)

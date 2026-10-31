@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from config import CONFIG
+
+BASE_CHANNELS = 62     # Board.current_state()
+ORACLE_CHANNELS = 76   # + 14 個天眼平面
+
 
 # ==================== SE Block（針對 62 通道優化）====================
 class SEBlock(nn.Module):
@@ -57,11 +62,12 @@ class ResBlock(nn.Module):
 
 # ==================== 針對你的 State 設計的完整網路 ====================
 class DarkChessNet(nn.Module):
-    def __init__(self, num_channels=256, num_res_blocks=10, num_actions=384):
+    def __init__(self, num_channels=256, num_res_blocks=10, num_actions=384, input_channels=BASE_CHANNELS):
         super().__init__()
 
-        # ⭐ 輸入：[B, 62, 4, 8] - 來自你的 Board.current_state()
-        self.input_channels = 62
+        # 輸入：[B, input_channels, 4, 8]；前 62 = Board.current_state()，76 = 再加 14 個天眼平面
+        self.base_channels = BASE_CHANNELS
+        self.input_channels = input_channels
 
         # 第一層卷積：62 -> 256 通道
         self.conv_block = nn.Conv2d(
@@ -74,7 +80,8 @@ class DarkChessNet(nn.Module):
         self.conv_block_bn = nn.BatchNorm2d(num_channels)
 
         # ⭐ 可選：在輸入層後加一個 SE Block（針對 62 通道）
-        self.input_se = SEBlock(self.input_channels, reduction=8)
+        # SE 只作用在原本 62 個 channel；天眼平面直接接到卷積，這樣 62->76 的初始輸出完全不變
+        self.input_se = SEBlock(self.base_channels, reduction=8)
 
         # 殘差塊（帶 SE）
         self.res_blocks = nn.ModuleList([
@@ -101,7 +108,10 @@ class DarkChessNet(nn.Module):
         # x shape: [B, 62, 4, 8]
 
         # ⭐ 可選：先對輸入的 62 通道做 SE
-        x = self.input_se(x)
+        if self.input_channels > self.base_channels:
+            x = torch.cat([self.input_se(x[:, :self.base_channels]), x[:, self.base_channels:]], dim=1)
+        else:
+            x = self.input_se(x)
 
         # 第一層卷積
         x = F.relu(self.conv_block_bn(self.conv_block(x)))
@@ -132,7 +142,13 @@ class DarkChessNet(nn.Module):
 
 # ==================== 與你的 Board 整合測試 ====================
 class PolicyValueNet:
-    def __init__(self, model_file=None, use_gpu=True, device=None):
+    def __init__(self, model_file=None, use_gpu=True, device=None, input_channels=None, blind=False):
+        # input_channels=None：依 CONFIG['oracle'] 決定 76 / 62
+        # blind=True：76 channel 網路但把天眼平面清成 0，且搜尋不開天眼(公平評估用)
+        if input_channels is None:
+            input_channels = ORACLE_CHANNELS if CONFIG.get('oracle', False) else BASE_CHANNELS
+        self.input_channels = input_channels
+        self.blind = blind
         # 自動判斷：如果沒有 GPU，會改用 CPU
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -147,7 +163,8 @@ class PolicyValueNet:
         self.policy_value_net = DarkChessNet(
             num_channels=256,
             num_res_blocks=10,
-            num_actions=384
+            num_actions=384,
+            input_channels=self.input_channels
         ).to(self.device)
 
         self.optimizer = torch.optim.AdamW(
@@ -158,9 +175,20 @@ class PolicyValueNet:
 
         if model_file:
             # 加上 map_location，讓在 CPU 也能載入 GPU 訓練好的模型
-            self.policy_value_net.load_state_dict(
-                torch.load(model_file, map_location=self.device)
-            )
+            state = torch.load(model_file, map_location=self.device)
+            w = state['conv_block.weight']
+            if w.shape[1] > self.input_channels:
+                raise ValueError(f'{model_file} 是 {w.shape[1]} channel，不能載入 {self.input_channels} channel 的網路')
+            if w.shape[1] < self.input_channels:
+                # 62 -> 76：新增的天眼 channel 權重補 0，網路輸出與原模型完全相同
+                pad = torch.zeros(w.shape[0], self.input_channels - w.shape[1], *w.shape[2:], dtype=w.dtype, device=w.device)
+                state['conv_block.weight'] = torch.cat([w, pad], dim=1)
+            self.policy_value_net.load_state_dict(state)
+
+    @property
+    def oracle_active(self):
+        """True = 這個網路會讀天眼平面、且搜尋要用 true_board 翻棋。"""
+        return self.input_channels > BASE_CHANNELS and not self.blind
 
     def policy_value(self, state_batch):
         self.policy_value_net.eval()
@@ -176,11 +204,14 @@ class PolicyValueNet:
 
         # ⭐ 使用你的 Board.current_state() 方法
         # 這會返回 shape=(62, 4, 8) 的 numpy array
-        current_state = board.current_state()
+        if self.input_channels > BASE_CHANNELS:
+            current_state = board.oracle_state(blind=self.blind)
+        else:
+            current_state = board.current_state()
 
         # 轉換成 PyTorch tensor
         current_state = np.ascontiguousarray(
-            current_state.reshape(1, 62, 4, 8)
+            current_state.reshape(1, self.input_channels, 4, 8)
         ).astype('float32')
         current_state = torch.as_tensor(current_state).to(self.device)
 

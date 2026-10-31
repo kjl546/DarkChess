@@ -51,7 +51,7 @@ def recovery_state_mcts_prob(tuple):
     state, mcts_prob, winner = tuple
     state = recovery_array(state)
     mcts_prob = recovery_array(mcts_prob)
-    state = state.reshape((62, 4, 8))
+    state = state.reshape((-1, 4, 8))
     mcts_prob = mcts_prob.reshape(384)
     return state, mcts_prob, winner
 

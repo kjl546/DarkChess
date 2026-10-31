@@ -93,7 +93,8 @@ class ChanceNode(TreeNode):
 
 
 class MCTS:
-    def __init__(self, policy_value_fn, c_puct=5, n_playout=2000):
+    def __init__(self, policy_value_fn, c_puct=5, n_playout=2000, oracle=False):
+        self._oracle = oracle   # 天眼：搜尋時翻棋結果取 true_board
         self._root = TreeNode(None, 1.0)
         self._policy = policy_value_fn
         self._c_puct = c_puct
@@ -146,7 +147,9 @@ class MCTS:
 
         for _ in range(self._n_playout):
             # 不再預先洗牌決定整串結果，每次翻棋都依當時的剩餘棋種抽樣。
-            self._playout(copy.deepcopy(state))
+            sim = copy.deepcopy(state)
+            sim.oracle_search = self._oracle
+            self._playout(sim)
 
         act_visits = [(act, node._n_visits) for act, node in self._root._children.items()
                       if act in legal_moves]
@@ -172,8 +175,11 @@ class MCTS:
 
 
 class MCTSPlayer:
-    def __init__(self, policy_value_function, c_puct=3, n_playout=2000, is_selfplay=0):
-        self.mcts = MCTS(policy_value_function, c_puct, n_playout)
+    def __init__(self, policy_value_function, c_puct=3, n_playout=2000, is_selfplay=0, oracle=None):
+        if oracle is None:
+            # 由網路自動判斷：76 channel 且非 blind 的網路才開天眼
+            oracle = bool(getattr(getattr(policy_value_function, '__self__', None), 'oracle_active', False))
+        self.mcts = MCTS(policy_value_function, c_puct, n_playout, oracle=oracle)
         self._is_selfplay = is_selfplay
         self.agent = 'AI'
         self.playout_count = 0

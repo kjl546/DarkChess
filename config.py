@@ -21,5 +21,6 @@ CONFIG = {
     'redis_host': 'localhost',
     'redis_port': 6379,
     'redis_db': 0,
-    'no_dark_mode': False
+    'no_dark_mode': False,
+    'oracle': True,          # 天眼實驗：True=76 channel
 }
