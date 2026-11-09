@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 import numpy as np
 import pickle
 import time
+import tempfile
 
 import zip_array
 from config import CONFIG
@@ -332,7 +333,7 @@ class TrainPipeline:
         # 每批記錄最後一次梯度更新的損失，與終端顯示一致。
         fields = ['timestamp', 'batch', 'generation', 'buffer_size',
                   'loss', 'value_loss', 'policy_loss', 'kl', 'entropy',
-                  'update_steps']
+                  'update_steps', 'train_seconds']
         row = {
             'timestamp': datetime.now().astimezone().isoformat(timespec='seconds'),
             'batch': batch,
@@ -342,6 +343,28 @@ class TrainPipeline:
             'entropy': float(entropy),
             **self.last_training_metrics,
         }
+        # 舊版 CSV 原子升級欄位，歷史耗時未知，保留空值。
+        if os.path.exists(self.training_log_path):
+            with open(self.training_log_path, newline='', encoding='utf-8') as source:
+                reader = csv.reader(source)
+                header = next(reader, None)
+                old_rows = list(reader) if header == fields[:-1] else None
+            if old_rows is not None:
+                temp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                            mode='w', newline='', encoding='utf-8', delete=False,
+                            dir=os.path.dirname(os.path.abspath(self.training_log_path))) as target:
+                        temp_path = target.name
+                        writer = csv.writer(target)
+                        writer.writerow(fields)
+                        writer.writerows(record + [''] for record in old_rows)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    os.replace(temp_path, self.training_log_path)
+                finally:
+                    if temp_path is not None and os.path.exists(temp_path):
+                        os.unlink(temp_path)
         # 關閉檔案前刷新資料，續訓追加且只建立一次欄位標題。
         with open(self.training_log_path, 'a+', newline='', encoding='utf-8') as log:
             log.seek(0)
@@ -362,7 +385,12 @@ class TrainPipeline:
             for i in range(self.start_iter, self.game_batch_num + self.start_iter):
                 generation = self._wait_for_training_data(last_iters)
                 print(f"訓練批次 {i + 1}，累積樣本數：{len(self.data_buffer)}")
+                train_started = time.perf_counter()
                 loss, entropy = self.policy_updata()
+                # 更新流程返回 CPU 數值前已完成 GPU 同步（item / numpy）。
+                train_seconds = time.perf_counter() - train_started
+                self.last_training_metrics['train_seconds'] = train_seconds
+                print(f'本批訓練耗時: {train_seconds:.3f} 秒')
                 self._append_training_metrics(i + 1, generation, loss, entropy)
                 # 真正完成更新才記錄版本，資料不足或讀取失敗不會消耗批次。
                 last_iters = generation

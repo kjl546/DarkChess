@@ -75,6 +75,27 @@ class TrainingFlowTests(unittest.TestCase):
             pipeline._append_training_metrics(1, 1, 0.5, 0.2)
         self.assertEqual(path.read_bytes(), before)
 
+    def test_metrics_upgrade_old_csv_preserves_history(self):
+        pipeline = train.TrainPipeline()
+        path = Path(pipeline.training_log_path)
+        fields = ['timestamp', 'batch', 'generation', 'buffer_size',
+                  'loss', 'value_loss', 'policy_loss', 'kl', 'entropy', 'update_steps']
+        old_row = ['old-time', '1', '1', '512', '0.5', '0.2', '0.3', '0.01', '0.8', '3']
+        with path.open('w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(fields)
+            writer.writerow(old_row)
+        pipeline.last_training_metrics = {'train_seconds': 2.5}
+        pipeline._append_training_metrics(2, 2, 0.4, 0.7)
+        pipeline._append_training_metrics(3, 3, 0.4, 0.7)
+        with path.open(newline='', encoding='utf-8') as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0], fields + ['train_seconds'])
+        self.assertEqual(rows[1], old_row + [''])
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[2][-1], '2.5')
+        self.assertEqual(rows[3][-1], '2.5')
+
     def checkpoint(self, step):
         path = self.models / f'new_current_policy_batch{step}.pth'
         path.touch()
@@ -186,8 +207,12 @@ class TrainingFlowTests(unittest.TestCase):
                 self.snapshot(4, 1)  # Enough samples in the same, unconsumed generation.
             elif pipeline.policy_updata.call_count == 1:
                 self.snapshot(4, 2)
-        with patch.object(train.time, 'sleep', side_effect=progress):
+        with patch.object(train.time, 'sleep', side_effect=progress), \
+                patch.object(train.time, 'perf_counter', side_effect=[10, 12.5, 30, 31.25]):
             pipeline.run()
+        with open(pipeline.training_log_path, newline='', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([float(r['train_seconds']) for r in rows], [2.5, 1.25])
         self.assertEqual(pipeline.policy_updata.call_count, 2)
         self.assertEqual(pipeline.iters, 2)
 
