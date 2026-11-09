@@ -754,20 +754,6 @@ class Game(object):
                     winner_z[np.array(current_players) == winner] = 1.0
                     winner_z[np.array(current_players) != winner] = -1.0
 
-                # 2. 吃子分數正規化 (副作用)
-                total_abs = sum(abs(r) for r in rewards) + 1e-8
-                scaled_rewards = np.array([r / total_abs for r in rewards])  # [-1, 1] 之間
-                alpha = 5  # 吃子影響比重 (可以調整 0.1 ~ 0.5)
-
-                # 3. 合併，勝負為主，吃子為輔
-                merged_rewards = winner_z + alpha * scaled_rewards
-
-                # 4. 縮放到 [-1, 1]
-                max_abs = np.max(np.abs(merged_rewards)) + 1e-8
-                merged_rewards = merged_rewards / max_abs
-
-                winner_z = merged_rewards  # 取代掉原本的 winner_z
-
                 red_rewards = [r for r, p in zip(winner_z, current_players) if p == 1]
                 black_rewards = [r for r, p in zip(winner_z, current_players) if p == 2]
 
