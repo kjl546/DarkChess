@@ -219,7 +219,11 @@ class PolicyValueNet:
         # 損失函數
         value_loss = F.mse_loss(value, winner_batch)
         policy_loss = -torch.mean(torch.sum(mcts_probs * log_act_probs, dim=1))
-        loss = value_loss + policy_loss
+
+        value_weight = 0.5
+        policy_weight = 1.0
+
+        loss = value_weight * value_loss + policy_weight * policy_loss
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_value_net.parameters(), max_norm=1.0)
