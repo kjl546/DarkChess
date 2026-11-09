@@ -165,6 +165,10 @@ class PolicyValueNet:
         entropy = -paddle.mean(
             paddle.sum(paddle.exp(log_act_probs) * log_act_probs, axis=1)
         )
+        self.last_loss_components = {
+            'value_loss': float(value_loss.numpy().item()),
+            'policy_loss': float(policy_loss.numpy().item()),
+        }
         return loss.numpy(), entropy.numpy()[0]
 
 

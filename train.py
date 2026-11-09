@@ -1,4 +1,6 @@
 """使用收集到数据进行训练"""
+import csv
+from datetime import datetime
 import glob
 import os
 import random
@@ -77,6 +79,9 @@ class TrainPipeline:
 
         self.best_policy_net = None
         self.iters = None
+        self.training_log_path = os.path.join(MODELS_DIR, 'training_metrics.csv')
+        self.last_training_metrics = {}
+        print(f'訓練紀錄 CSV: {os.path.abspath(self.training_log_path)}')
         self.data_poll_interval = float(CONFIG.get(
             'train_data_poll_interval', 5 if CONFIG['use_redis'] else 30))
         if self.batch_size <= 0 or self.buffer_size < self.batch_size:
@@ -316,7 +321,39 @@ class TrainPipeline:
 
         print(f"kl:{kl:.5f}, lr_multiplier:{self.lr_multiplier:.3f}, loss:{loss}, entropy:{entropy}, "
               f"explained_var_old:{explained_var_old:.9f}, explained_var_new:{explained_var_new:.9f}")
+        self.last_training_metrics = {
+            **getattr(self.policy_value_net, 'last_loss_components', {}),
+            'kl': float(kl),
+            'update_steps': i + 1,
+        }
         return loss, entropy
+
+    def _append_training_metrics(self, batch, generation, loss, entropy):
+        # 每批記錄最後一次梯度更新的損失，與終端顯示一致。
+        fields = ['timestamp', 'batch', 'generation', 'buffer_size',
+                  'loss', 'value_loss', 'policy_loss', 'kl', 'entropy',
+                  'update_steps']
+        row = {
+            'timestamp': datetime.now().astimezone().isoformat(timespec='seconds'),
+            'batch': batch,
+            'generation': generation,
+            'buffer_size': len(self.data_buffer),
+            'loss': float(loss),
+            'entropy': float(entropy),
+            **self.last_training_metrics,
+        }
+        # 關閉檔案前刷新資料，續訓追加且只建立一次欄位標題。
+        with open(self.training_log_path, 'a+', newline='', encoding='utf-8') as log:
+            log.seek(0)
+            header = next(csv.reader(log), None)
+            if header is not None and header != fields:
+                raise ValueError(f'CSV 欄位不符: {self.training_log_path}')
+            log.seek(0, os.SEEK_END)
+            writer = csv.DictWriter(log, fieldnames=fields)
+            if header is None:
+                writer.writeheader()
+            writer.writerow(row)
+            log.flush()
 
     def run(self):
         try:
@@ -326,6 +363,7 @@ class TrainPipeline:
                 generation = self._wait_for_training_data(last_iters)
                 print(f"訓練批次 {i + 1}，累積樣本數：{len(self.data_buffer)}")
                 loss, entropy = self.policy_updata()
+                self._append_training_metrics(i + 1, generation, loss, entropy)
                 # 真正完成更新才記錄版本，資料不足或讀取失敗不會消耗批次。
                 last_iters = generation
                 time.sleep(CONFIG['train_update_interval'])

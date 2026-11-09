@@ -230,6 +230,10 @@ class PolicyValueNet:
                 torch.sum(torch.exp(log_act_probs) * log_act_probs, dim=1)
             )
 
+        self.last_loss_components = {
+            'value_loss': value_loss.item(),
+            'policy_loss': policy_loss.item(),
+        }
         return loss.item(), entropy.item()
 
     def save_model(self, model_file):

@@ -1,4 +1,5 @@
 """Training-flow regressions: temporary data and mocked models; no training job."""
+import csv
 import contextlib
 import io
 import os
@@ -42,6 +43,37 @@ class TrainingFlowTests(unittest.TestCase):
         self.output = contextlib.redirect_stdout(io.StringIO())
         self.output.__enter__()
         self.addCleanup(self.output.__exit__, None, None, None)
+
+    def test_metrics_append_across_restart_with_one_header(self):
+        pipeline = train.TrainPipeline()
+        pipeline.last_training_metrics = {
+            'value_loss': 0.2, 'policy_loss': 0.3, 'kl': 0.01,
+            'update_steps': 3,
+        }
+        pipeline._append_training_metrics(1, 7, 0.5, 0.8)
+        restarted = train.TrainPipeline()
+        restarted.last_training_metrics = pipeline.last_training_metrics
+        restarted._append_training_metrics(2, 8, 0.5, 0.8)
+        with open(pipeline.training_log_path, newline='', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r['batch'] for r in rows], ['1', '2'])
+        self.assertEqual([r['generation'] for r in rows], ['7', '8'])
+        self.assertAlmostEqual(float(rows[0]['loss']),
+                               float(rows[0]['value_loss']) + float(rows[0]['policy_loss']))
+        self.assertEqual(rows[0]['kl'], '0.01')
+        self.assertEqual(rows[0]['entropy'], '0.8')
+        self.assertEqual(rows[0]['update_steps'], '3')
+        self.assertTrue(rows[0]['timestamp'])
+
+    def test_metrics_reject_incompatible_header_without_appending(self):
+        pipeline = train.TrainPipeline()
+        path = Path(pipeline.training_log_path)
+        path.write_text('wrong,header\n', encoding='utf-8')
+        before = path.read_bytes()
+        with self.assertRaises(ValueError):
+            pipeline._append_training_metrics(1, 1, 0.5, 0.2)
+        self.assertEqual(path.read_bytes(), before)
 
     def checkpoint(self, step):
         path = self.models / f'new_current_policy_batch{step}.pth'
